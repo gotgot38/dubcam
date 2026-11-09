@@ -9,10 +9,13 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
+import android.widget.MediaController
 import android.widget.Toast
+import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -41,23 +44,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
 
 enum class AppState {
-    IDLE,               // Prêt à filmer
-    RECORDING_VIDEO,    // Phase 1 : Vidéo sans son
-    WAITING_AUDIO,      // En attente du doublage
-    RECORDING_AUDIO,    // Phase 2 : Son seul (même durée)
-    PROCESSING,         // Fusion vidéo + son
-    PREVIEW             // Lecture du résultat
+    IDLE,
+    RECORDING_VIDEO,
+    WAITING_AUDIO,
+    RECORDING_AUDIO,
+    PROCESSING,
+    PREVIEW
 }
 
 class MainActivity : ComponentActivity() {
@@ -75,7 +74,6 @@ class MainActivity : ComponentActivity() {
 fun DubCamScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
 
     var hasPermissions by remember {
         mutableStateOf(
@@ -116,7 +114,6 @@ fun DubCamScreen() {
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var mediaRecorder by remember { mutableStateOf<MediaRecorder?>(null) }
 
-    // Chronomètre pour Phase 1 et Phase 2
     LaunchedEffect(appState) {
         if (appState == AppState.RECORDING_VIDEO) {
             val start = System.currentTimeMillis()
@@ -129,7 +126,6 @@ fun DubCamScreen() {
             while (appState == AppState.RECORDING_AUDIO) {
                 elapsedMs = System.currentTimeMillis() - start
                 if (elapsedMs >= targetDurationMs) {
-                    // Arrêt automatique à la durée exacte de la vidéo
                     try {
                         mediaRecorder?.stop()
                         mediaRecorder?.release()
@@ -143,7 +139,6 @@ fun DubCamScreen() {
         }
     }
 
-    // Fusion automatique dès le passage en PROCESSING
     LaunchedEffect(appState) {
         if (appState == AppState.PROCESSING) {
             withContext(Dispatchers.IO) {
@@ -157,7 +152,6 @@ fun DubCamScreen() {
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         if (appState == AppState.PREVIEW) {
-            // Lecteur vidéo final
             VideoPlayerView(
                 file = finalFile,
                 onRestart = {
@@ -167,7 +161,6 @@ fun DubCamScreen() {
                 }
             )
         } else {
-            // Aperçu Caméra
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
@@ -200,7 +193,6 @@ fun DubCamScreen() {
                 }
             )
 
-            // Bandeau d'état en haut
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -233,17 +225,15 @@ fun DubCamScreen() {
                 }
             }
 
-            // Barre de progression pour la phase audio
             if (appState == AppState.RECORDING_AUDIO && targetDurationMs > 0) {
                 val progress = (elapsedMs.toFloat() / targetDurationMs.toFloat()).coerceIn(0f, 1f)
                 LinearProgressIndicator(
-                    progress = { progress },
+                    progress = progress,
                     modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(bottom = 140.dp),
                     color = Color(0xFF1E88E5)
                 )
             }
 
-            // Contrôles en bas
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -253,7 +243,6 @@ fun DubCamScreen() {
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Bouton annuler si en phase d'attente audio
                 if (appState == AppState.WAITING_AUDIO) {
                     TextButton(onClick = {
                         elapsedMs = 0L
@@ -266,7 +255,6 @@ fun DubCamScreen() {
                     Spacer(Modifier.width(64.dp))
                 }
 
-                // Bouton Déclencheur Principal
                 val buttonColor = when (appState) {
                     AppState.IDLE, AppState.RECORDING_VIDEO -> Color(0xFFE53935)
                     AppState.WAITING_AUDIO, AppState.RECORDING_AUDIO -> Color(0xFF1E88E5)
@@ -284,7 +272,6 @@ fun DubCamScreen() {
                         .clickable(enabled = appState != AppState.PROCESSING) {
                             when (appState) {
                                 AppState.IDLE -> {
-                                    // Démarrer Phase 1 (Vidéo sans audio)
                                     if (videoFile.exists()) videoFile.delete()
                                     val outputOptions = FileOutputOptions.Builder(videoFile).build()
                                     activeRecording = videoCapture?.output
@@ -297,13 +284,11 @@ fun DubCamScreen() {
                                     appState = AppState.RECORDING_VIDEO
                                 }
                                 AppState.RECORDING_VIDEO -> {
-                                    // Stopper Phase 1
                                     targetDurationMs = elapsedMs
                                     activeRecording?.stop()
                                     activeRecording = null
                                 }
                                 AppState.WAITING_AUDIO -> {
-                                    // Démarrer Phase 2 (Audio seul)
                                     if (audioFile.exists()) audioFile.delete()
                                     val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                                         MediaRecorder(context)
@@ -326,7 +311,6 @@ fun DubCamScreen() {
                                     appState = AppState.RECORDING_AUDIO
                                 }
                                 AppState.RECORDING_AUDIO -> {
-                                    // Stopper Phase 2 manuellement si souhaité avant la fin
                                     try {
                                         mediaRecorder?.stop()
                                         mediaRecorder?.release()
@@ -347,7 +331,6 @@ fun DubCamScreen() {
                     )
                 }
 
-                // Bouton changer de caméra (uniquement au repos)
                 if (appState == AppState.IDLE) {
                     TextButton(onClick = {
                         lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
@@ -368,27 +351,19 @@ fun DubCamScreen() {
 
 @Composable
 fun VideoPlayerView(file: File, onRestart: () -> Unit) {
-    val context = LocalContext.current
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(file.toURI().toString()))
-            repeatMode = ExoPlayer.REPEAT_MODE_ALL
-            prepare()
-            playWhenReady = true
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { exoPlayer.release() }
-    }
-
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = true
+                VideoView(ctx).apply {
+                    val controller = MediaController(ctx)
+                    controller.setAnchorView(this)
+                    setMediaController(controller)
+                    setVideoURI(Uri.fromFile(file))
+                    setOnPreparedListener { mp ->
+                        mp.isLooping = true
+                        start()
+                    }
                 }
             }
         )
