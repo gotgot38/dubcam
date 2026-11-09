@@ -110,10 +110,45 @@ fun DubCamScreen() {
     val audioFile = remember { File(context.cacheDir, "temp_audio.m4a") }
     val finalFile = remember { File(context.cacheDir, "dubcam_final.mp4") }
 
+    val previewView = remember {
+        PreviewView(context).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+    }
     var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var mediaRecorder by remember { mutableStateOf<MediaRecorder?>(null) }
 
+    // Initialisation de la caméra UNIQUEMENT quand on change de capteur (avant/arrière) ou qu'on quitte la preview
+    LaunchedEffect(lensFacing, appState == AppState.PREVIEW) {
+        if (appState != AppState.PREVIEW) {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(QualitySelector.from(Quality.HD))
+                    .build()
+                val vc = VideoCapture.withOutput(recorder)
+                videoCapture = vc
+
+                val cameraSelector = CameraSelector.Builder()
+                    .requireLensFacing(lensFacing)
+                    .build()
+
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, vc)
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Erreur caméra : ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }, ContextCompat.getMainExecutor(context))
+        }
+    }
+
+    // Gestion du chronomètre Phase 1 et Phase 2
     LaunchedEffect(appState) {
         if (appState == AppState.RECORDING_VIDEO) {
             val start = System.currentTimeMillis()
@@ -139,14 +174,30 @@ fun DubCamScreen() {
         }
     }
 
+    // Assemblage vidéo + son et sauvegarde galerie
     LaunchedEffect(appState) {
         if (appState == AppState.PROCESSING) {
-            withContext(Dispatchers.IO) {
-                muxVideoAndAudio(videoFile, audioFile, finalFile)
-                saveToGallery(context, finalFile)
+            val success = withContext(Dispatchers.IO) {
+                try {
+                    if (!videoFile.exists() || videoFile.length() == 0L) return@withContext false
+                    if (!audioFile.exists() || audioFile.length() == 0L) return@withContext false
+                    muxVideoAndAudio(videoFile, audioFile, finalFile)
+                    saveToGallery(context, finalFile)
+                    true
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    false
+                }
             }
-            Toast.makeText(context, "Vidéo enregistrée dans la galerie !", Toast.LENGTH_SHORT).show()
-            appState = AppState.PREVIEW
+            if (success && finalFile.exists() && finalFile.length() > 0L) {
+                Toast.makeText(context, "Vidéo enregistrée dans la galerie !", Toast.LENGTH_SHORT).show()
+                appState = AppState.PREVIEW
+            } else {
+                Toast.makeText(context, "Erreur lors de l'assemblage (durée trop courte ?)", Toast.LENGTH_LONG).show()
+                elapsedMs = 0L
+                targetDurationMs = 0L
+                appState = AppState.IDLE
+            }
         }
     }
 
@@ -163,36 +214,10 @@ fun DubCamScreen() {
         } else {
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    PreviewView(ctx).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                    }
-                },
-                update = { previewView ->
-                    val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-                    cameraProviderFuture.addListener({
-                        val cameraProvider = cameraProviderFuture.get()
-                        val preview = Preview.Builder().build().also {
-                            it.setSurfaceProvider(previewView.surfaceProvider)
-                        }
-                        val recorder = Recorder.Builder()
-                            .setQualitySelector(QualitySelector.from(Quality.HD))
-                            .build()
-                        val vc = VideoCapture.withOutput(recorder)
-                        videoCapture = vc
-
-                        val cameraSelector = CameraSelector.Builder()
-                            .requireLensFacing(lensFacing)
-                            .build()
-
-                        try {
-                            cameraProvider.unbindAll()
-                            cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, vc)
-                        } catch (_: Exception) {}
-                    }, ContextCompat.getMainExecutor(context))
-                }
+                factory = { previewView }
             )
 
+            // Bandeau d'état en haut
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -272,43 +297,58 @@ fun DubCamScreen() {
                         .clickable(enabled = appState != AppState.PROCESSING) {
                             when (appState) {
                                 AppState.IDLE -> {
+                                    val vc = videoCapture ?: return@clickable
                                     if (videoFile.exists()) videoFile.delete()
+                                    elapsedMs = 0L
                                     val outputOptions = FileOutputOptions.Builder(videoFile).build()
-                                    activeRecording = videoCapture?.output
-                                        ?.prepareRecording(context, outputOptions)
-                                        ?.start(ContextCompat.getMainExecutor(context)) { event ->
+                                    activeRecording = vc.output
+                                        .prepareRecording(context, outputOptions)
+                                        .start(ContextCompat.getMainExecutor(context)) { event ->
                                             if (event is VideoRecordEvent.Finalize) {
-                                                appState = AppState.WAITING_AUDIO
+                                                if (!event.hasError()) {
+                                                    appState = AppState.WAITING_AUDIO
+                                                } else {
+                                                    Toast.makeText(context, "Erreur vidéo : ${event.error}", Toast.LENGTH_SHORT).show()
+                                                    appState = AppState.IDLE
+                                                }
                                             }
                                         }
                                     appState = AppState.RECORDING_VIDEO
                                 }
                                 AppState.RECORDING_VIDEO -> {
+                                    if (elapsedMs < 500L) {
+                                        Toast.makeText(context, "Filme au moins 1 seconde", Toast.LENGTH_SHORT).show()
+                                        return@clickable
+                                    }
                                     targetDurationMs = elapsedMs
                                     activeRecording?.stop()
                                     activeRecording = null
                                 }
                                 AppState.WAITING_AUDIO -> {
                                     if (audioFile.exists()) audioFile.delete()
-                                    val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                        MediaRecorder(context)
-                                    } else {
-                                        @Suppress("DEPRECATION")
-                                        MediaRecorder()
+                                    try {
+                                        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                            MediaRecorder(context)
+                                        } else {
+                                            @Suppress("DEPRECATION")
+                                            MediaRecorder()
+                                        }
+                                        recorder.apply {
+                                            setAudioSource(MediaRecorder.AudioSource.MIC)
+                                            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                                            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                                            setAudioSamplingRate(44100)
+                                            setAudioEncodingBitRate(128000)
+                                            setOutputFile(audioFile.absolutePath)
+                                            prepare()
+                                            start()
+                                        }
+                                        mediaRecorder = recorder
+                                        elapsedMs = 0L
+                                        appState = AppState.RECORDING_AUDIO
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Erreur micro : ${e.message}", Toast.LENGTH_LONG).show()
                                     }
-                                    recorder.apply {
-                                        setAudioSource(MediaRecorder.AudioSource.MIC)
-                                        setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                                        setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                                        setAudioSamplingRate(44100)
-                                        setAudioEncodingBitRate(128000)
-                                        setOutputFile(audioFile.absolutePath)
-                                        prepare()
-                                        start()
-                                    }
-                                    mediaRecorder = recorder
-                                    elapsedMs = 0L
-                                    appState = AppState.RECORDING_AUDIO
                                 }
                                 AppState.RECORDING_AUDIO -> {
                                     try {
@@ -396,17 +436,15 @@ private fun muxVideoAndAudio(videoFile: File, audioFile: File, outputFile: File)
 
     val videoTrackIndex = (0 until videoExtractor.trackCount).firstOrNull {
         videoExtractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-    } ?: return
+    } ?: throw IllegalStateException("Piste vidéo introuvable")
     videoExtractor.selectTrack(videoTrackIndex)
     val muxerVideoTrack = muxer.addTrack(videoExtractor.getTrackFormat(videoTrackIndex))
 
     val audioTrackIndex = (0 until audioExtractor.trackCount).firstOrNull {
         audioExtractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-    }
-    val muxerAudioTrack = if (audioTrackIndex != null) {
-        audioExtractor.selectTrack(audioTrackIndex)
-        muxer.addTrack(audioExtractor.getTrackFormat(audioTrackIndex))
-    } else -1
+    } ?: throw IllegalStateException("Piste audio introuvable")
+    audioExtractor.selectTrack(audioTrackIndex)
+    val muxerAudioTrack = muxer.addTrack(audioExtractor.getTrackFormat(audioTrackIndex))
 
     muxer.start()
 
@@ -414,9 +452,7 @@ private fun muxVideoAndAudio(videoFile: File, audioFile: File, outputFile: File)
     val bufferInfo = MediaCodec.BufferInfo()
 
     copySamples(videoExtractor, muxer, muxerVideoTrack, buffer, bufferInfo)
-    if (muxerAudioTrack != -1) {
-        copySamples(audioExtractor, muxer, muxerAudioTrack, buffer, bufferInfo)
-    }
+    copySamples(audioExtractor, muxer, muxerAudioTrack, buffer, bufferInfo)
 
     muxer.stop()
     muxer.release()
@@ -449,12 +485,18 @@ private fun saveToGallery(context: Context, file: File) {
         put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/DubCam")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
         }
     }
     val uri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
     uri?.let {
         context.contentResolver.openOutputStream(it)?.use { out ->
             file.inputStream().use { input -> input.copyTo(out) }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.clear()
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+            context.contentResolver.update(it, values, null, null)
         }
     }
 }
