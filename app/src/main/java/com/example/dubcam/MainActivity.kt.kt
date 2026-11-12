@@ -51,12 +51,12 @@ import java.io.File
 import java.nio.ByteBuffer
 
 enum class AppState {
-    IDLE,
-    RECORDING_AUDIO,
-    WAITING_VIDEO,
-    RECORDING_VIDEO,
-    PROCESSING,
-    PREVIEW
+    IDLE,               // Prêt pour Phase 1 (Vidéo muette)
+    RECORDING_VIDEO,    // Phase 1 : Enregistrement vidéo sans son
+    WAITING_AUDIO,      // En attente de Phase 2 (Son)
+    RECORDING_AUDIO,    // Phase 2 : Enregistrement son seul (même durée)
+    PROCESSING,         // Fusion vidéo + audio
+    PREVIEW             // Lecture du résultat
 }
 
 class MainActivity : ComponentActivity() {
@@ -106,8 +106,8 @@ fun DubCamScreen() {
     var targetDurationMs by remember { mutableLongStateOf(0L) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
 
-    val audioFile = remember { File(context.cacheDir, "temp_audio.m4a") }
     val videoFile = remember { File(context.cacheDir, "temp_video.mp4") }
+    val audioFile = remember { File(context.cacheDir, "temp_audio.m4a") }
     val finalFile = remember { File(context.cacheDir, "dubcam_final.mp4") }
 
     val previewView = remember {
@@ -119,6 +119,7 @@ fun DubCamScreen() {
     var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var mediaRecorder by remember { mutableStateOf<MediaRecorder?>(null) }
 
+    // Initialisation de la caméra (uniquement au changement d'objectif ou sortie de preview)
     LaunchedEffect(lensFacing, appState == AppState.PREVIEW) {
         if (appState != AppState.PREVIEW) {
             val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -147,20 +148,26 @@ fun DubCamScreen() {
         }
     }
 
+    // Chronomètre Phase 1 (Vidéo) et Phase 2 (Son minuté)
     LaunchedEffect(appState) {
-        if (appState == AppState.RECORDING_AUDIO) {
-            val start = System.currentTimeMillis()
-            while (appState == AppState.RECORDING_AUDIO) {
-                elapsedMs = System.currentTimeMillis() - start
-                delay(50)
-            }
-        } else if (appState == AppState.RECORDING_VIDEO) {
+        if (appState == AppState.RECORDING_VIDEO) {
             val start = System.currentTimeMillis()
             while (appState == AppState.RECORDING_VIDEO) {
                 elapsedMs = System.currentTimeMillis() - start
+                delay(50)
+            }
+        } else if (appState == AppState.RECORDING_AUDIO) {
+            val start = System.currentTimeMillis()
+            while (appState == AppState.RECORDING_AUDIO) {
+                elapsedMs = System.currentTimeMillis() - start
                 if (elapsedMs >= targetDurationMs) {
-                    activeRecording?.stop()
-                    activeRecording = null
+                    // Arrêt automatique du son dès que la durée de la vidéo est atteinte
+                    try {
+                        mediaRecorder?.stop()
+                        mediaRecorder?.release()
+                    } catch (_: Exception) {}
+                    mediaRecorder = null
+                    appState = AppState.PROCESSING
                     break
                 }
                 delay(30)
@@ -168,6 +175,7 @@ fun DubCamScreen() {
         }
     }
 
+    // Assemblage vidéo + audio et sauvegarde galerie
     LaunchedEffect(appState) {
         if (appState == AppState.PROCESSING) {
             val success = withContext(Dispatchers.IO) {
@@ -210,6 +218,7 @@ fun DubCamScreen() {
                 factory = { previewView }
             )
 
+            // Bandeau d'état et timer en haut
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -218,17 +227,17 @@ fun DubCamScreen() {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 val statusText = when (appState) {
-                    AppState.IDLE -> "PHASE 1 : PRÊT (SON)"
-                    AppState.RECORDING_AUDIO -> "SON : ${formatTime(elapsedMs)}"
-                    AppState.WAITING_VIDEO -> "PHASE 2 : PRÊT (VIDÉO ${formatTime(targetDurationMs)})"
-                    AppState.RECORDING_VIDEO -> "VIDÉO : ${formatTime(elapsedMs)} / ${formatTime(targetDurationMs)}"
+                    AppState.IDLE -> "PHASE 1 : PRÊT (VIDÉO)"
+                    AppState.RECORDING_VIDEO -> "VIDÉO : ${formatTime(elapsedMs)}"
+                    AppState.WAITING_AUDIO -> "PHASE 2 : PRÊT (SON ${formatTime(targetDurationMs)})"
+                    AppState.RECORDING_AUDIO -> "SON : ${formatTime(elapsedMs)} / ${formatTime(targetDurationMs)}"
                     AppState.PROCESSING -> "ASSEMBLAGE..."
                     else -> ""
                 }
                 val badgeColor = when (appState) {
-                    AppState.RECORDING_AUDIO -> Color(0xFF1E88E5)
-                    AppState.WAITING_VIDEO -> Color(0xFFFFB300)
                     AppState.RECORDING_VIDEO -> Color(0xFFE53935)
+                    AppState.WAITING_AUDIO -> Color(0xFFFFB300)
+                    AppState.RECORDING_AUDIO -> Color(0xFF1E88E5)
                     else -> Color.Black.copy(alpha = 0.6f)
                 }
 
@@ -242,15 +251,17 @@ fun DubCamScreen() {
                 }
             }
 
-            if (appState == AppState.RECORDING_VIDEO && targetDurationMs > 0) {
+            // Barre de progression pendant la Phase 2 (Son)
+            if (appState == AppState.RECORDING_AUDIO && targetDurationMs > 0) {
                 val progress = (elapsedMs.toFloat() / targetDurationMs.toFloat()).coerceIn(0f, 1f)
                 LinearProgressIndicator(
                     progress = progress,
                     modifier = Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(bottom = 140.dp),
-                    color = Color(0xFFE53935)
+                    color = Color(0xFF1E88E5)
                 )
             }
 
+            // Contrôles en bas
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -260,7 +271,7 @@ fun DubCamScreen() {
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (appState == AppState.WAITING_VIDEO) {
+                if (appState == AppState.WAITING_AUDIO) {
                     TextButton(onClick = {
                         elapsedMs = 0L
                         targetDurationMs = 0L
@@ -272,12 +283,13 @@ fun DubCamScreen() {
                     Spacer(Modifier.width(64.dp))
                 }
 
+                // Bouton déclencheur principal : Rouge en Phase 1 (Vidéo), Bleu en Phase 2 (Son)
                 val buttonColor = when (appState) {
-                    AppState.IDLE, AppState.RECORDING_AUDIO -> Color(0xFF1E88E5)
-                    AppState.WAITING_VIDEO, AppState.RECORDING_VIDEO -> Color(0xFFE53935)
+                    AppState.IDLE, AppState.RECORDING_VIDEO -> Color(0xFFE53935)
+                    AppState.WAITING_AUDIO, AppState.RECORDING_AUDIO -> Color(0xFF1E88E5)
                     else -> Color.Gray
                 }
-                val isRecording = appState == AppState.RECORDING_AUDIO || appState == AppState.RECORDING_VIDEO
+                val isRecording = appState == AppState.RECORDING_VIDEO || appState == AppState.RECORDING_AUDIO
 
                 Box(
                     modifier = Modifier
@@ -289,6 +301,37 @@ fun DubCamScreen() {
                         .clickable(enabled = appState != AppState.PROCESSING) {
                             when (appState) {
                                 AppState.IDLE -> {
+                                    // Démarrer Phase 1 : Enregistrement VIDÉO sans son
+                                    val vc = videoCapture ?: return@clickable
+                                    if (videoFile.exists()) videoFile.delete()
+                                    elapsedMs = 0L
+                                    val outputOptions = FileOutputOptions.Builder(videoFile).build()
+                                    activeRecording = vc.output
+                                        .prepareRecording(context, outputOptions)
+                                        .start(ContextCompat.getMainExecutor(context)) { event ->
+                                            if (event is VideoRecordEvent.Finalize) {
+                                                if (!event.hasError()) {
+                                                    appState = AppState.WAITING_AUDIO
+                                                } else {
+                                                    Toast.makeText(context, "Erreur vidéo : ${event.error}", Toast.LENGTH_SHORT).show()
+                                                    appState = AppState.IDLE
+                                                }
+                                            }
+                                        }
+                                    appState = AppState.RECORDING_VIDEO
+                                }
+                                AppState.RECORDING_VIDEO -> {
+                                    // Stopper Phase 1 (Vidéo) et mémoriser la durée
+                                    if (elapsedMs < 500L) {
+                                        Toast.makeText(context, "Filme au moins 1 seconde", Toast.LENGTH_SHORT).show()
+                                        return@clickable
+                                    }
+                                    targetDurationMs = elapsedMs
+                                    activeRecording?.stop()
+                                    activeRecording = null
+                                }
+                                AppState.WAITING_AUDIO -> {
+                                    // Démarrer Phase 2 : Enregistrement SON seul (même durée)
                                     if (audioFile.exists()) audioFile.delete()
                                     try {
                                         val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -315,40 +358,13 @@ fun DubCamScreen() {
                                     }
                                 }
                                 AppState.RECORDING_AUDIO -> {
-                                    if (elapsedMs < 500L) {
-                                        Toast.makeText(context, "Enregistre au moins 1 seconde de son", Toast.LENGTH_SHORT).show()
-                                        return@clickable
-                                    }
-                                    targetDurationMs = elapsedMs
+                                    // Stopper Phase 2 manuellement avant la fin si souhaité
                                     try {
                                         mediaRecorder?.stop()
                                         mediaRecorder?.release()
                                     } catch (_: Exception) {}
                                     mediaRecorder = null
-                                    appState = AppState.WAITING_VIDEO
-                                }
-                                AppState.WAITING_VIDEO -> {
-                                    val vc = videoCapture ?: return@clickable
-                                    if (videoFile.exists()) videoFile.delete()
-                                    elapsedMs = 0L
-                                    val outputOptions = FileOutputOptions.Builder(videoFile).build()
-                                    activeRecording = vc.output
-                                        .prepareRecording(context, outputOptions)
-                                        .start(ContextCompat.getMainExecutor(context)) { event ->
-                                            if (event is VideoRecordEvent.Finalize) {
-                                                if (!event.hasError()) {
-                                                    appState = AppState.PROCESSING
-                                                } else {
-                                                    Toast.makeText(context, "Erreur vidéo : ${event.error}", Toast.LENGTH_SHORT).show()
-                                                    appState = AppState.WAITING_VIDEO
-                                                }
-                                            }
-                                        }
-                                    appState = AppState.RECORDING_VIDEO
-                                }
-                                AppState.RECORDING_VIDEO -> {
-                                    activeRecording?.stop()
-                                    activeRecording = null
+                                    appState = AppState.PROCESSING
                                 }
                                 else -> {}
                             }
@@ -363,7 +379,8 @@ fun DubCamScreen() {
                     )
                 }
 
-                if (appState == AppState.IDLE || appState == AppState.WAITING_VIDEO) {
+                // Bouton changer de caméra (uniquement avant Phase 1)
+                if (appState == AppState.IDLE) {
                     TextButton(onClick = {
                         lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
                             CameraSelector.LENS_FACING_FRONT
